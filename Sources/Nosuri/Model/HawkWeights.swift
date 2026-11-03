@@ -344,3 +344,152 @@ public struct HawkAttentionLayerWeights: Sendable, Equatable {
     }
 }
 
+/// Deterministic 64-bit SplitMix PRNG so weight initialization is reproducible across platforms.
+public struct SplitMix64: RandomNumberGenerator, Sendable {
+    private var state: UInt64
+
+    public init(seed: UInt64) {
+        self.state = seed &+ 0x9E37_79B9_7F4A_7C15
+    }
+
+    public mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+
+    /// Uniform float in `(-scale, +scale)`.
+    public mutating func nextSignedUniform(scale: Float) -> Float {
+        let u = Float(next() >> 40) * (1.0 / 16_777_216.0)
+        return (2.0 * u - 1.0) * scale
+    }
+}
+
+extension HawkWeights {
+    /// Initializes a `HawkWeights` instance with Glorot-scaled uniform weights and RG-LRU log-decay
+    /// parameters spread across `initialTimeConstants`.
+    public static func makeRandom(
+        inputDim: Int = CommentStreamFrontEnd.inputDim,
+        modelDim: Int = 64,
+        rnnDim: Int = 64,
+        mlpDim: Int = 128,
+        heads: Int = 4,
+        convWidth: Int = 4,
+        convRight: Int = 0,
+        numLayers: Int = 2,
+        outputDim: Int = ReactionStateSpec.numBaseClasses,
+        attentionAfter: [Int] = [],
+        attentionHeads: Int = 0,
+        attentionWindow: Int = 0,
+        seed: UInt64 = 42
+    ) -> HawkWeights {
+        var rng = SplitMix64(seed: seed)
+
+        func glorot(_ rows: Int, _ cols: Int) -> [Float] {
+            let scale = sqrtf(6.0 / Float(rows + cols))
+            var out = [Float](repeating: 0, count: rows * cols)
+            for i in 0..<(rows * cols) {
+                out[i] = rng.nextSignedUniform(scale: scale)
+            }
+            return out
+        }
+
+        let wIn = glorot(inputDim, modelDim)
+        let bIn = [Float](repeating: 0.01, count: modelDim)
+
+        let headDim = rnnDim / max(1, heads)
+        let convTaps = convWidth + convRight
+        let convScale = 1.0 / sqrtf(Float(max(1, convTaps)))
+
+        var layers: [HawkLayerWeights] = []
+        layers.reserveCapacity(numLayers)
+        for _ in 0..<numLayers {
+            let norm1 = [Float](repeating: 1.0, count: modelDim)
+            let wGate = glorot(modelDim, rnnDim)
+            let wX = glorot(modelDim, rnnDim)
+
+            var convW = [Float](repeating: 0, count: convTaps * rnnDim)
+            for k in 0..<convTaps {
+                for d in 0..<rnnDim {
+                    if k == convWidth - 1 {
+                        convW[k * rnnDim + d] = 0.8 + rng.nextSignedUniform(scale: 0.1)
+                    } else {
+                        convW[k * rnnDim + d] = rng.nextSignedUniform(scale: 0.25 * convScale)
+                    }
+                }
+            }
+            let convB = [Float](repeating: 0, count: rnnDim)
+
+            let gateScale = sqrtf(6.0 / Float(headDim + headDim))
+            var wA = [Float](repeating: 0, count: heads * headDim * headDim)
+            var wI = [Float](repeating: 0, count: heads * headDim * headDim)
+            for i in 0..<wA.count {
+                wA[i] = rng.nextSignedUniform(scale: gateScale)
+                wI[i] = rng.nextSignedUniform(scale: gateScale)
+            }
+            let bA = [Float](repeating: 0, count: rnnDim)
+            let bI = [Float](repeating: 0, count: rnnDim)
+            let lambda = HawkWeights.initialLambda(rnnDim: rnnDim)
+
+            let wO = glorot(rnnDim, modelDim)
+            let norm2 = [Float](repeating: 1.0, count: modelDim)
+            let wMLPGate = glorot(modelDim, mlpDim)
+            let wMLPUp = glorot(modelDim, mlpDim)
+            let wMLPDown = glorot(mlpDim, modelDim)
+
+            layers.append(HawkLayerWeights(
+                norm1: norm1, wGate: wGate, wX: wX, convW: convW, convB: convB,
+                wA: wA, bA: bA, wI: wI, bI: bI, lambda: lambda, wO: wO,
+                norm2: norm2, wMLPGate: wMLPGate, wMLPUp: wMLPUp, wMLPDown: wMLPDown
+            ))
+        }
+
+        var attention: [HawkAttentionLayerWeights] = []
+        if attentionHeads > 0, attentionAfter.isEmpty != true {
+            attention.reserveCapacity(attentionAfter.count)
+            let attnHeadDim = modelDim / attentionHeads
+            let qTotal = attentionHeads * attnHeadDim
+            for after in attentionAfter {
+                attention.append(HawkAttentionLayerWeights(
+                    after: after,
+                    norm1: [Float](repeating: 1.0, count: modelDim),
+                    wQ: glorot(modelDim, qTotal),
+                    wK: glorot(modelDim, attnHeadDim),
+                    wV: glorot(modelDim, attnHeadDim),
+                    wO: glorot(qTotal, modelDim),
+                    norm2: [Float](repeating: 1.0, count: modelDim),
+                    wMLPGate: glorot(modelDim, mlpDim),
+                    wMLPUp: glorot(modelDim, mlpDim),
+                    wMLPDown: glorot(mlpDim, modelDim)
+                ))
+            }
+        }
+
+        let finalNorm = [Float](repeating: 1.0, count: modelDim)
+        let wOut = glorot(modelDim, outputDim)
+        let bOut = [Float](repeating: 0, count: outputDim)
+
+        return HawkWeights(
+            inputDim: inputDim,
+            modelDim: modelDim,
+            rnnDim: rnnDim,
+            mlpDim: mlpDim,
+            heads: heads,
+            convWidth: convWidth,
+            convRight: convRight,
+            outputDim: outputDim,
+            wIn: wIn,
+            bIn: bIn,
+            layers: layers,
+            finalNorm: finalNorm,
+            wOut: wOut,
+            bOut: bOut,
+            attention: attention,
+            attentionHeads: attention.isEmpty ? 0 : attentionHeads,
+            attentionWindow: attention.isEmpty ? 0 : attentionWindow
+        )
+    }
+}
+

@@ -1,8 +1,6 @@
 import XCTest
 @testable import Nosuri
-#if canImport(MLX)
 import MLX
-#endif
 
 /// Tests for the Hawk network, streaming state consistency, SafeTensors serialization, and BPTT training.
 final class HawkTests: XCTestCase {
@@ -63,16 +61,16 @@ final class HawkTests: XCTestCase {
         XCTAssertEqual(loaded, weights)
     }
 
-    func testCPUClassificationTrainingReducesLoss() {
+    func testMLXClassificationTrainingReducesLoss() {
         let weights = smallCPUWeights(convRight: 0)
-        let trainer = HawkCPUTrainer(weights: weights, learningRate: 0.01)
+        let trainer = MLXHawkTrainer(network: MLXHawkNetwork(weights: weights), learningRate: 0.01)
         let batch: [[[Float]]] = [makeFeatures(frames: 12, dim: 12), makeFeatures(frames: 10, dim: 12, phase: 5)]
         let targets: [[Int]] = [Array(repeating: 2, count: 12), Array(repeating: 5, count: 10)]
-        let first = trainer.trainBatchClassification(featuresBatch: batch, targetsBatch: targets)
+        let first = trainer.trainBatchClassification(featuresBatch: batch, targetsBatch: targets, compiled: false)
         var last = first
         var step = 0
         while step < 25 {
-            last = trainer.trainBatchClassification(featuresBatch: batch, targetsBatch: targets)
+            last = trainer.trainBatchClassification(featuresBatch: batch, targetsBatch: targets, compiled: false)
             step += 1
         }
         XCTAssertFalse(last.isNaN)

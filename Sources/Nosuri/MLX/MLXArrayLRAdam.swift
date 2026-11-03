@@ -1,4 +1,3 @@
-#if canImport(MLX)
 import Foundation
 import MLX
 import MLXNN
@@ -59,4 +58,3 @@ public final class ArrayLRAdam: Optimizer {
         model.update(parameters: newParameters)
     }
 }
-#endif

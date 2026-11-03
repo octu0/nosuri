@@ -1,25 +1,6 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-#if os(macOS)
-let packageDependencies: [Package.Dependency] = [
-    .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.21.0")
-]
-let engineDependencies: [Target.Dependency] = [
-    .product(name: "MLX", package: "mlx-swift"),
-    .product(name: "MLXNN", package: "mlx-swift"),
-    .product(name: "MLXOptimizers", package: "mlx-swift")
-]
-let mlxTargetDependencies: [Target.Dependency] = [
-    "Nosuri",
-    .product(name: "MLX", package: "mlx-swift")
-]
-#else
-let packageDependencies: [Package.Dependency] = []
-let engineDependencies: [Target.Dependency] = []
-let mlxTargetDependencies: [Target.Dependency] = ["Nosuri"]
-#endif
-
 let package = Package(
     name: "nosuri",
     platforms: [
@@ -32,16 +13,25 @@ let package = Package(
         .executable(name: "server", targets: ["server"]),
         .executable(name: "benchmark", targets: ["benchmark"])
     ],
-    dependencies: packageDependencies,
+    dependencies: [
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.33.0")
+    ],
     targets: [
         .target(
             name: "Nosuri",
-            dependencies: engineDependencies,
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXOptimizers", package: "mlx-swift")
+            ],
             path: "Sources/Nosuri"
         ),
         .executableTarget(
             name: "train",
-            dependencies: mlxTargetDependencies,
+            dependencies: [
+                "Nosuri",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
             path: "script/train"
         ),
         .executableTarget(
@@ -61,7 +51,10 @@ let package = Package(
         ),
         .testTarget(
             name: "NosuriTests",
-            dependencies: mlxTargetDependencies,
+            dependencies: [
+                "Nosuri",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
             path: "Tests/NosuriTests"
         )
     ]

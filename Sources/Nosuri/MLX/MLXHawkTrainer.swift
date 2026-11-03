@@ -1,4 +1,3 @@
-#if canImport(MLX)
 import Foundation
 import MLX
 import MLXNN
@@ -15,6 +14,7 @@ public final class MLXHawkTrainer: @unchecked Sendable {
 
     /// Compiled training steps keyed by padded sequence length (frames rounded up to a multiple of 32).
     private var compiledSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledSoftSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
     /// MLX buffer cache limit at the default width.
     public static let cacheLimitBytes = 24 << 30
@@ -28,7 +28,7 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         self.network = network
         self.optimizer = ArrayLRAdam(learningRate: learningRate)
         let scaled = Self.cacheLimitBytes / max(1, network.modelDim / HawkShape.defaultModelDim)
-        MLX.GPU.set(cacheLimit: max(Self.minCacheLimitBytes, scaled))
+        MLX.Memory.cacheLimit = max(Self.minCacheLimitBytes, scaled)
     }
 
     public func updateLearningRate(_ lr: Float) {
@@ -41,7 +41,13 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         optimizer.resetState()
         adamSteps = 0
         compiledSteps.removeAll()
+        compiledSoftSteps.removeAll()
         eval(network, optimizer)
+    }
+
+    /// Exports current model parameters to `HawkWeights`.
+    public var weights: HawkWeights {
+        return network.exportWeights()
     }
 
     /// Inference logits [B, T, outputDim].
@@ -127,6 +133,91 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         return lossValues[0].item(Float.self)
     }
 
+    /// Runs one frame-level soft-target cross-entropy training step over comment sequences and returns the loss.
+    /// `targetDistributionsBatch[b][t]` is a probability distribution over `0..<outputDim` for frame `t` of sequence `b`.
+    public func trainBatchSoftTargets(
+        featuresBatch: [[[Float]]],
+        targetDistributionsBatch: [[[Float]]],
+        compiled: Bool = true
+    ) -> Float {
+        var validFeatures: [[[Float]]] = []
+        var validDists: [[[Float]]] = []
+        var b = 0
+        while b < min(featuresBatch.count, targetDistributionsBatch.count) {
+            let frames = min(featuresBatch[b].count, targetDistributionsBatch[b].count)
+            if 0 < frames {
+                validFeatures.append(Array(featuresBatch[b].prefix(frames)))
+                validDists.append(Array(targetDistributionsBatch[b].prefix(frames)))
+            }
+            b += 1
+        }
+        if validFeatures.isEmpty {
+            return 0.0
+        }
+        let (features, maxT) = padded(validFeatures)
+        let outDim = network.outputDim
+        var distFlat = [Float](repeating: 0.0, count: validFeatures.count * maxT * outDim)
+        var maskFlat = [Float](repeating: 0.0, count: validFeatures.count * maxT)
+        var frameCounts = [Int32](repeating: 0, count: validFeatures.count)
+        b = 0
+        while b < validFeatures.count {
+            let frames = validFeatures[b].count
+            frameCounts[b] = Int32(frames)
+            var t = 0
+            while t < frames {
+                let row = validDists[b][t]
+                let base = (b * maxT + t) * outDim
+                var c = 0
+                while c < min(outDim, row.count) {
+                    distFlat[base + c] = row[c]
+                    c += 1
+                }
+                maskFlat[b * maxT + t] = 1.0
+                t += 1
+            }
+            b += 1
+        }
+        let targetProbs = MLXArray(distFlat, [validFeatures.count, maxT, outDim])
+        let mask = MLXArray(maskFlat, [validFeatures.count, maxT])
+        let counts = MLXArray(frameCounts)
+
+        let lossFn = { (model: MLXHawkNetwork, arrays: [MLXArray]) -> [MLXArray] in
+            let logits = model(arrays[0], frameCounts: arrays[3])
+            let logp = logSoftmax(logits, axis: -1)
+            let frameCE = -sum(arrays[1] * logp, axis: -1)
+            let validMask = arrays[2]
+            return [sum(frameCE * validMask) / maximum(sum(validMask), MLXArray(Float(1.0)))]
+        }
+        let lg = valueAndGrad(model: network, lossFn)
+        func step(arrays: [MLXArray]) -> [MLXArray] {
+            let (lossValues, grads) = lg(self.network, Array(arrays[0..<4]))
+            let (clipped, norm) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+            let outer = self.optimizer.learningRate
+            self.optimizer.learningRate = arrays[4]
+            self.optimizer.update(model: self.network, gradients: clipped)
+            self.optimizer.learningRate = outer
+            return lossValues + [norm]
+        }
+        var stepFn: ([MLXArray]) -> [MLXArray] = step
+        if compiled {
+            switch compiledSoftSteps[maxT] {
+            case .some(let cached):
+                stepFn = cached
+            case .none:
+                let fn = compile(inputs: [network, optimizer], outputs: [network, optimizer], step)
+                compiledSoftSteps[maxT] = fn
+                stepFn = fn
+            }
+        }
+        adamSteps += 1
+        let t = Float(adamSteps)
+        let lr = optimizer.learningRate * ((1.0 - pow(optimizer.betas.1, t)).squareRoot() / (1.0 - pow(optimizer.betas.0, t)))
+        let lossValues = stepFn([features, targetProbs, mask, counts, lr])
+        eval(network, optimizer, lossValues)
+        lastGradientNorm = lossValues[1].item(Float.self)
+        return lossValues[0].item(Float.self)
+    }
+
     /// Stacks sequences into [B, T, inputDim], zero-padding T up to a multiple of 32 to limit distinct compiled shapes.
     private func padded(_ batch: [[[Float]]]) -> (MLXArray, Int) {
         var maxT = 0
@@ -154,5 +245,4 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         return (MLXArray(flat, [batch.count, maxT, inDim]), maxT)
     }
 }
-#endif
 

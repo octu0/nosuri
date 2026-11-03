@@ -1,11 +1,11 @@
-#if canImport(MLX)
 import Foundation
 import MLX
 import MLXNN
 
-/// Linear recurrence h_t = a_t h_{t-1} + x_t (h_{-1} = 0) over [B, T, R], one Metal thread per channel.
-/// The backward pass is a reverse-time scan kernel, so graph size does not grow with sequence length.
+/// Linear recurrence h_t = a_t h_{t-1} + x_t (h_{-1} = 0) over [B, T, R].
+/// Uses a custom Metal scan kernel on macOS and a parallel associative scan (`O(log T)` tensor ops) on CUDA / other MLX backends.
 public enum MLXLinearScan {
+    #if os(macOS)
     static let forwardKernel = MLXFast.metalKernel(
         name: "hawk_linear_scan_forward",
         inputNames: ["a", "x"],
@@ -84,17 +84,46 @@ public enum MLXLinearScan {
             )
         }
     }
+    #endif
+
+    /// Parallel associative scan over time axis 1 using standard `MLXArray` primitives (runs natively on CUDA & Metal).
+    public static func associativeScan(_ aIn: MLXArray, _ xIn: MLXArray) -> MLXArray {
+        var curA = aIn.asType(.float32)
+        var curX = xIn.asType(.float32)
+        let frames = curX.shape[1]
+        var stride = 1
+        while stride < frames {
+            let headX = curX[0..., 0..<stride, 0...]
+            let tailX = curX[0..., stride..<frames, 0...]
+            let prevX = curX[0..., 0..<(frames - stride), 0...]
+            let tailA = curA[0..., stride..<frames, 0...]
+            curX = concatenated([headX, tailX + tailA * prevX], axis: 1)
+
+            if stride * 2 < frames {
+                let headA = curA[0..., 0..<stride, 0...]
+                let prevA = curA[0..., 0..<(frames - stride), 0...]
+                curA = concatenated([headA, tailA * prevA], axis: 1)
+            }
+            stride *= 2
+        }
+        return curX
+    }
 
     /// a, x: [B, T, R] (float32). Returns h: [B, T, R].
     public static func scan(_ a: MLXArray, _ x: MLXArray) -> MLXArray {
+        #if os(macOS)
         return function([a.asType(.float32), x.asType(.float32)])[0]
+        #else
+        return associativeScan(a, x)
+        #endif
     }
 }
 
 /// Causal local multi-query attention: out[b, t, h] = Σ_o p_o v[b, t-o] over the last W frames (0 ≤ o < W, t-o ≥ 0),
 /// p = softmax_o(q[b, t, h] · k[b, t-o]). q: [B, T, H, D] (already scaled), k, v: [B, T, D].
-/// One SIMD group per (b, t, h) row; each lane holds every 32nd channel and every 32nd offset's score.
+/// Uses a custom Metal kernel on macOS and standard `MLXArray` masked batched matmul on CUDA / other MLX backends.
 public enum MLXLocalAttention {
+    #if os(macOS)
     static let forwardKernel = MLXFast.metalKernel(
         name: "hawk_local_attention_forward",
         inputNames: ["q", "k", "v"],
@@ -315,10 +344,42 @@ public enum MLXLocalAttention {
         functions[window] = f
         return f
     }
+    #endif
+
+    /// Standard `MLXArray` implementation of causal local multi-query attention (runs natively on CUDA & Metal).
+    public static func attendStandard(_ qIn: MLXArray, _ kIn: MLXArray, _ vIn: MLXArray, window: Int) -> MLXArray {
+        let q = qIn.asType(.float32)
+        let k = kIn.asType(.float32)
+        let v = vIn.asType(.float32)
+        let frames = q.dim(1)
+
+        // q: [B, T, H, D] -> [B, H, T, D]
+        let qTrans = q.transposed(0, 2, 1, 3)
+        // k: [B, T, D] -> [B, 1, D, T]
+        let kTrans = k.expandedDimensions(axis: 1).transposed(0, 1, 3, 2)
+        // v: [B, T, D] -> [B, 1, T, D]
+        let vTrans = v.expandedDimensions(axis: 1)
+
+        let scores = matmul(qTrans, kTrans) // [B, H, T, T]
+        var maskValues = [Float](repeating: -1e9, count: frames * frames)
+        for t in 0..<frames {
+            let sMin = max(0, t - window + 1)
+            for s in sMin...t {
+                maskValues[t * frames + s] = 0.0
+            }
+        }
+        let mask = MLXArray(maskValues, [1, 1, frames, frames])
+        let probs = softmax(scores + mask, axis: -1)
+        return matmul(probs, vTrans).transposed(0, 2, 1, 3)
+    }
 
     /// q: [B, T, H, D], k, v: [B, T, D] (float32). Returns [B, T, H, D].
     public static func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, window: Int) -> MLXArray {
+        #if os(macOS)
         return function(window: window)([q.asType(.float32), k.asType(.float32), v.asType(.float32)])[0]
+        #else
+        return attendStandard(q, k, v, window: window)
+        #endif
     }
 }
 
@@ -746,5 +807,4 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
         )
     }
 }
-#endif
 

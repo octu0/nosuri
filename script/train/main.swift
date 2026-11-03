@@ -145,7 +145,11 @@ if let impPath = importWeightsPath {
     print("initialized Hawk network (\(initialWeights.parameterCount) parameters)")
 }
 
-let trainer = HawkCPUTrainer(weights: initialWeights, learningRate: Defaults.lrMax)
+let trainer = MLXHawkTrainer(
+    network: MLXHawkNetwork(weights: initialWeights),
+    learningRate: Defaults.lrMax
+)
+print("backend: MLX GPU (Metal / CUDA)")
 
 if 0 < epochs {
     let batchesPerEpoch = max(1, (sequences.count + batchSize - 1) / batchSize)
