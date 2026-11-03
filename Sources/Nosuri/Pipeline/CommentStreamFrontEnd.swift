@@ -2,12 +2,15 @@ import Foundation
 
 /// Represents one node in a `reaction_state` transition string such as `"#0"`, `"#5"`, `"#5_2"`, `"#5_3"`.
 public struct ReactionStateSpec: Sendable, Equatable {
+    public static let numBaseClasses = 39
+    public static let idle = ReactionStateSpec(baseIndex: 0, tier: 1)
+
     public let id: String
     public let baseIndex: Int
     public let tier: Int
 
     public init(baseIndex: Int, tier: Int = 1) {
-        let clampedBase = max(0, min(ReactionCatalog.numBaseClasses - 1, baseIndex))
+        let clampedBase = max(0, min(Self.numBaseClasses - 1, baseIndex))
         let clampedTier = clampedBase == 0 ? 1 : max(1, min(3, tier))
         self.baseIndex = clampedBase
         self.tier = clampedTier

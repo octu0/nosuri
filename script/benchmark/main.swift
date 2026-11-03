@@ -11,7 +11,7 @@ let rnnDim = HawkShape.rnnDim
 let mlpDim = HawkShape.mlpDim
 let heads = HawkShape.heads
 let convWidth = HawkShape.convWidth
-let outDim = ReactionCatalog.numBaseClasses
+let outDim = ReactionStateSpec.numBaseClasses
 
 func makeLayer() -> HawkLayerWeights {
     return HawkLayerWeights(

@@ -2,35 +2,19 @@ import XCTest
 @testable import Nosuri
 
 final class ReactionCatalogTests: XCTestCase {
-    func testDynamicDirectoryDiscoveryAndEscalation() throws {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("catalog_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+    func testReactionStateSpecAndStreamEngineSustainDecay() throws {
+        XCTAssertEqual(ReactionStateSpec.numBaseClasses, 39)
+        XCTAssertEqual(ReactionStateSpec.idle.id, "#0")
+        XCTAssertEqual(ReactionStateSpec(baseIndex: 9, tier: 1).id, "#9")
+        XCTAssertEqual(ReactionStateSpec(baseIndex: 9, tier: 2).id, "#9_2")
+        XCTAssertEqual(ReactionStateSpec(baseIndex: 9, tier: 3).id, "#9_3")
 
-        for name in ["#0_idleA.mp4", "#0_2_idleB.mp4", "#9_normal.mp4", "#9_2_escalated.mp4"] {
-            _ = FileManager.default.createFile(atPath: tempDir.appendingPathComponent(name).path, contents: Data())
-        }
-
-        let catalog = ReactionCatalog(directory: tempDir.path)
-        XCTAssertEqual(catalog.baseReactions.count, 39)
-        XCTAssertEqual(catalog.idleClips.count, 2)
-
-        let base9 = catalog.resolveClip(baseIndex: 9, commentVelocity: 0.4, superChatJPY: 0)
-        XCTAssertEqual(base9.id, "#9")
-        XCTAssertEqual(base9.filename, "#9_normal.mp4")
-
-        let fast9 = catalog.resolveClip(baseIndex: 9, commentVelocity: 1.5, superChatJPY: 0)
-        XCTAssertEqual(fast9.id, "#9_2")
-        XCTAssertEqual(fast9.filename, "#9_2_escalated.mp4")
-
-        let superChat9 = catalog.resolveClip(baseIndex: 9, commentVelocity: 0.2, superChatJPY: 10000)
-        XCTAssertEqual(superChat9.id, "#9_2")
-
-        let idle0 = catalog.resolveClip(baseIndex: 0, commentVelocity: 0.0, idleStep: 0)
-        let idle1 = catalog.resolveClip(baseIndex: 0, commentVelocity: 0.0, idleStep: 1)
-        XCTAssertEqual(idle0.baseIndex, 0)
-        XCTAssertEqual(idle1.baseIndex, 0)
-        XCTAssertNotEqual(idle0.filename, idle1.filename)
+        let engine = ReactionStreamEngine(
+            network: HawkNetwork(weights: .makeRandom())
+        )
+        let initial = engine.state(at: 0.0)
+        XCTAssertEqual(initial.state, ReactionStateSpec.idle)
+        XCTAssertEqual(initial.state.baseIndex, 0)
     }
 
     func testMultiFormatDatasetLoading() throws {

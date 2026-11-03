@@ -101,7 +101,7 @@ for ds in datasets {
 
 let frontEnd = CommentStreamFrontEnd()
 let slopeFilter = EmotionSlopeFilter(
-    numClasses: ReactionCatalog.numBaseClasses,
+    numClasses: ReactionStateSpec.numBaseClasses,
     stepGain: stepGain
 )
 
@@ -119,7 +119,7 @@ for ds in datasets {
 }
 
 print("loaded \(totalScenarioCount) scenarios (\(totalEventCount) comments) -> \(sequences.count) training episodes")
-print("inputDim: \(CommentStreamFrontEnd.inputDim) / reaction classes: \(ReactionCatalog.numBaseClasses)")
+print("inputDim: \(CommentStreamFrontEnd.inputDim) / reaction classes: \(ReactionStateSpec.numBaseClasses)")
 
 var initialWeights = HawkWeights.makeRandom(
     inputDim: CommentStreamFrontEnd.inputDim,
@@ -130,7 +130,7 @@ var initialWeights = HawkWeights.makeRandom(
     convWidth: 4,
     convRight: 0,
     numLayers: 2,
-    outputDim: ReactionCatalog.numBaseClasses,
+    outputDim: ReactionStateSpec.numBaseClasses,
     seed: Defaults.seed
 )
 

@@ -21,7 +21,7 @@ public struct EmotionSlopeFilter: Sendable {
     }
 
     public init(
-        numClasses: Int = ReactionCatalog.numBaseClasses,
+        numClasses: Int = ReactionStateSpec.numBaseClasses,
         windowSeconds: Double = 12.0,
         stepGain: Float = 0.22,
         activeRetention: Float = 0.96,

@@ -576,7 +576,7 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
     }
 
     /// Network with the default shape (`HawkShape`) on the standard comment stream feature input.
-    public convenience init(outputDim: Int = ReactionCatalog.numBaseClasses) {
+    public convenience init(outputDim: Int = ReactionStateSpec.numBaseClasses) {
         self.init(
             inputDim: CommentStreamFrontEnd.inputDim,
             modelDim: HawkShape.modelDim,

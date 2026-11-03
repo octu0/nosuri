@@ -1,20 +1,20 @@
 import Foundation
 
 public struct ReactionCandidate: Sendable, Equatable {
-    public let baseIndex: Int
-    public let clip: ReactionClip
+    public let state: ReactionStateSpec
     public let probability: Float
 
-    public init(baseIndex: Int, clip: ReactionClip, probability: Float) {
-        self.baseIndex = baseIndex
-        self.clip = clip
+    public var baseIndex: Int { state.baseIndex }
+
+    public init(state: ReactionStateSpec, probability: Float) {
+        self.state = state
         self.probability = probability
     }
 }
 
 public struct ReactionPrediction: Sendable, Equatable {
-    public let clip: ReactionClip
-    public let baseClip: ReactionClip
+    public let state: ReactionStateSpec
+    public let baseState: ReactionStateSpec
     public let escalated: Bool
     public let phase: String
     public let intensity: Float
@@ -24,8 +24,8 @@ public struct ReactionPrediction: Sendable, Equatable {
     public let topCandidates: [ReactionCandidate]
 
     public init(
-        clip: ReactionClip,
-        baseClip: ReactionClip,
+        state: ReactionStateSpec,
+        baseState: ReactionStateSpec,
         escalated: Bool,
         phase: String = "idle",
         intensity: Float = 0.0,
@@ -34,8 +34,8 @@ public struct ReactionPrediction: Sendable, Equatable {
         superChatJPY: Int,
         topCandidates: [ReactionCandidate]
     ) {
-        self.clip = clip
-        self.baseClip = baseClip
+        self.state = state
+        self.baseState = baseState
         self.escalated = escalated
         self.phase = phase
         self.intensity = intensity
@@ -52,7 +52,6 @@ public struct ReactionPrediction: Sendable, Equatable {
 public final class ReactionStreamEngine: @unchecked Sendable {
     public let network: HawkNetwork
     public let frontEnd: CommentStreamFrontEnd
-    public let catalog: ReactionCatalog
     public private(set) var state: HawkNetwork.State
     public let escalationProbability: Float
     private var idleStepCount: Int = 0
@@ -67,12 +66,10 @@ public final class ReactionStreamEngine: @unchecked Sendable {
 
     public init(
         network: HawkNetwork,
-        catalog: ReactionCatalog = .shared,
         windowSeconds: Double = 12.0,
         escalationProbability: Float = 0.64
     ) {
         self.network = network
-        self.catalog = catalog
         self.frontEnd = CommentStreamFrontEnd(windowSeconds: windowSeconds)
         self.state = network.makeState()
         self.escalationProbability = escalationProbability
@@ -92,8 +89,8 @@ public final class ReactionStreamEngine: @unchecked Sendable {
         lastProbabilities = []
     }
 
-    public func push(_ event: CommentEvent) -> ReactionClip {
-        return pushDetailed(event).clip
+    public func push(_ event: CommentEvent) -> ReactionStateSpec {
+        return pushDetailed(event).state
     }
 
     /// Ingests a comment and returns the reaction state at `event.timestamp`.
@@ -105,17 +102,16 @@ public final class ReactionStreamEngine: @unchecked Sendable {
     /// Uses `timestamp - lastCommentTimestamp` and the active crowd size to calculate emotional decay.
     public func state(at timestamp: Double, topK: Int = 5) -> ReactionPrediction {
         guard let lastTs = lastCommentTimestamp else {
-            let idleClip = catalog.resolveClip(baseIndex: 0, commentVelocity: 0.0, superChatJPY: 0, idleStep: idleStepCount)
             return ReactionPrediction(
-                clip: idleClip,
-                baseClip: idleClip,
+                state: .idle,
+                baseState: .idle,
                 escalated: false,
                 phase: "idle",
                 intensity: 1.0,
                 velocity: 0.0,
                 uniqueUsers: 0,
                 superChatJPY: 0,
-                topCandidates: [ReactionCandidate(baseIndex: 0, clip: idleClip, probability: 1.0)]
+                topCandidates: [ReactionCandidate(state: .idle, probability: 1.0)]
             )
         }
 
@@ -123,18 +119,16 @@ public final class ReactionStreamEngine: @unchecked Sendable {
         let crowdScale = min(1.0, log1pf(max(0.0, Float(lastUniqueUsers) - 1.0)) / log1pf(30.0))
 
         if previousBaseIndex <= 0 || previousIntensity <= 0.0 {
-            let step = idleStepCount + max(0, Int(elapsed / 3.0))
-            let idleClip = catalog.resolveClip(baseIndex: 0, commentVelocity: 0.0, superChatJPY: 0, idleStep: step)
             return ReactionPrediction(
-                clip: idleClip,
-                baseClip: idleClip,
+                state: .idle,
+                baseState: .idle,
                 escalated: false,
                 phase: "idle",
                 intensity: 1.0,
                 velocity: 0.0,
                 uniqueUsers: lastUniqueUsers,
                 superChatJPY: 0,
-                topCandidates: [ReactionCandidate(baseIndex: 0, clip: idleClip, probability: 1.0)]
+                topCandidates: [ReactionCandidate(state: .idle, probability: 1.0)]
             )
         }
 
@@ -146,13 +140,11 @@ public final class ReactionStreamEngine: @unchecked Sendable {
         let decayedUsers = max(0, Int((Float(lastUniqueUsers) * powf(0.60 + 0.28 * crowdScale, decaySteps)).rounded()))
 
         if decayedIntensity < 0.24 {
-            let step = idleStepCount + max(1, Int(elapsed / 3.0))
-            let idleClip = catalog.resolveClip(baseIndex: 0, commentVelocity: decayedVelocity, superChatJPY: 0, idleStep: step)
             let idleProb = max(0.5, 1.0 - decayedIntensity)
-            let prevClip = catalog.resolveClip(baseIndex: previousBaseIndex, commentVelocity: 0.0, superChatJPY: 0, virtualTier: 1)
+            let prevState = ReactionStateSpec(baseIndex: previousBaseIndex, tier: 1)
             return ReactionPrediction(
-                clip: idleClip,
-                baseClip: idleClip,
+                state: .idle,
+                baseState: .idle,
                 escalated: false,
                 phase: "idle",
                 intensity: idleProb,
@@ -160,8 +152,8 @@ public final class ReactionStreamEngine: @unchecked Sendable {
                 uniqueUsers: decayedUsers,
                 superChatJPY: 0,
                 topCandidates: [
-                    ReactionCandidate(baseIndex: 0, clip: idleClip, probability: idleProb),
-                    ReactionCandidate(baseIndex: previousBaseIndex, clip: prevClip, probability: decayedIntensity)
+                    ReactionCandidate(state: .idle, probability: idleProb),
+                    ReactionCandidate(state: prevState, probability: decayedIntensity)
                 ]
             )
         }
@@ -187,46 +179,27 @@ public final class ReactionStreamEngine: @unchecked Sendable {
             "rising"
         }
 
-        let baseClip = catalog.resolveClip(
-            baseIndex: previousBaseIndex,
-            commentVelocity: 0.0,
-            superChatJPY: 0,
-            idleStep: idleStepCount,
-            virtualTier: 1
-        )
-        let resolvedClip = catalog.resolveClip(
-            baseIndex: previousBaseIndex,
-            commentVelocity: decayedVelocity,
-            superChatJPY: isDecaying ? 0 : lastSuperChatJPY,
-            idleStep: idleStepCount,
-            virtualTier: tier
-        )
-        let idleClip = catalog.resolveClip(
-            baseIndex: 0,
-            commentVelocity: decayedVelocity,
-            superChatJPY: 0,
-            idleStep: idleStepCount
-        )
+        let baseState = ReactionStateSpec(baseIndex: previousBaseIndex, tier: 1)
+        let resolvedState = ReactionStateSpec(baseIndex: previousBaseIndex, tier: tier)
 
         var candidates: [ReactionCandidate] = [
-            ReactionCandidate(baseIndex: previousBaseIndex, clip: resolvedClip, probability: decayedIntensity),
-            ReactionCandidate(baseIndex: 0, clip: idleClip, probability: max(0.0, 1.0 - decayedIntensity))
+            ReactionCandidate(state: resolvedState, probability: decayedIntensity),
+            ReactionCandidate(state: .idle, probability: max(0.0, 1.0 - decayedIntensity))
         ]
         if lastProbabilities.isEmpty != true {
             for i in 1..<lastProbabilities.count where i != previousBaseIndex && candidates.count < max(1, topK) {
                 let p = lastProbabilities[i] * factor
                 if p > 0.01 {
-                    let cClip = catalog.resolveClip(baseIndex: i, commentVelocity: 0.0, superChatJPY: 0, virtualTier: 1)
-                    candidates.append(ReactionCandidate(baseIndex: i, clip: cClip, probability: p))
+                    candidates.append(ReactionCandidate(state: ReactionStateSpec(baseIndex: i, tier: 1), probability: p))
                 }
             }
         }
         candidates.sort { $0.probability > $1.probability }
 
         return ReactionPrediction(
-            clip: resolvedClip,
-            baseClip: baseClip,
-            escalated: resolvedClip.baseIndex > 0 && resolvedClip.tier >= 2,
+            state: resolvedState,
+            baseState: baseState,
+            escalated: resolvedState.baseIndex > 0 && resolvedState.tier >= 2,
             phase: phase,
             intensity: decayedIntensity,
             velocity: decayedVelocity,
@@ -282,7 +255,7 @@ public final class ReactionStreamEngine: @unchecked Sendable {
 
         let velocity = frontEnd.currentVelocity
         let uniqueUsers = frontEnd.currentUniqueUsers
-        let classCount = ReactionCatalog.numBaseClasses
+        let classCount = ReactionStateSpec.numBaseClasses
 
         guard let scores = logProbs.last, scores.isEmpty != true else {
             return state(at: event.timestamp, topK: topK)
@@ -375,35 +348,19 @@ public final class ReactionStreamEngine: @unchecked Sendable {
         let k = max(1, min(topK, indexed.count))
         let topCandidates: [ReactionCandidate] = indexed.prefix(k).map { item in
             let itemTier = (item.index == bestIdx) ? virtualTier : 1
-            let candidateClip = catalog.resolveClip(
-                baseIndex: item.index,
-                commentVelocity: velocity,
-                superChatJPY: event.superChatJPY,
-                idleStep: idleStepCount,
-                virtualTier: itemTier
+            return ReactionCandidate(
+                state: ReactionStateSpec(baseIndex: item.index, tier: itemTier),
+                probability: item.prob
             )
-            return ReactionCandidate(baseIndex: item.index, clip: candidateClip, probability: item.prob)
         }
 
-        let baseClip = catalog.resolveClip(
-            baseIndex: bestIdx,
-            commentVelocity: 0.0,
-            superChatJPY: 0,
-            idleStep: idleStepCount,
-            virtualTier: 1
-        )
-        let resolvedClip = catalog.resolveClip(
-            baseIndex: bestIdx,
-            commentVelocity: velocity,
-            superChatJPY: event.superChatJPY,
-            idleStep: idleStepCount,
-            virtualTier: virtualTier
-        )
+        let baseState = ReactionStateSpec(baseIndex: bestIdx, tier: 1)
+        let resolvedState = ReactionStateSpec(baseIndex: bestIdx, tier: virtualTier)
 
         return ReactionPrediction(
-            clip: resolvedClip,
-            baseClip: baseClip,
-            escalated: resolvedClip.baseIndex > 0 && resolvedClip.tier >= 2,
+            state: resolvedState,
+            baseState: baseState,
+            escalated: resolvedState.baseIndex > 0 && resolvedState.tier >= 2,
             phase: phase,
             intensity: bestIdx > 0 ? bestProb : probs[0],
             velocity: velocity,

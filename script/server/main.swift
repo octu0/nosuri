@@ -162,6 +162,112 @@ private struct IncomingWSMessage: Decodable {
     let deltaSeconds: Double?
 }
 
+private struct VideoClipEntry {
+    let id: String
+    let baseIndex: Int
+    let tier: Int
+    let filename: String
+}
+
+private struct VideoResourceMapper {
+    let idleClips: [VideoClipEntry]
+    let baseReactions: [VideoClipEntry]
+    let escalatedVariants: [Int: [VideoClipEntry]]
+
+    init(directory: String) {
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
+        let mp4Files = entries.filter { $0.hasPrefix("#") && $0.lowercased().hasSuffix(".mp4") }.sorted()
+
+        var discoveredIdle: [VideoClipEntry] = []
+        var discoveredBase: [Int: VideoClipEntry] = [:]
+        var discoveredEscalated: [Int: [VideoClipEntry]] = [:]
+
+        for file in mp4Files {
+            guard let parsed = Self.parseFilename(file) else { continue }
+            if parsed.baseIndex == 0 {
+                discoveredIdle.append(parsed)
+                if parsed.tier == 1 && discoveredBase[0] == nil {
+                    discoveredBase[0] = parsed
+                }
+            } else if parsed.tier == 1 {
+                if discoveredBase[parsed.baseIndex] == nil {
+                    discoveredBase[parsed.baseIndex] = parsed
+                }
+            } else {
+                discoveredEscalated[parsed.baseIndex, default: []].append(parsed)
+            }
+        }
+
+        discoveredIdle.sort { a, b in
+            if a.tier != b.tier { return a.tier < b.tier }
+            return a.filename < b.filename
+        }
+        if discoveredIdle.isEmpty {
+            discoveredIdle = [VideoClipEntry(id: "#0", baseIndex: 0, tier: 1, filename: "#0.mp4")]
+        }
+        if discoveredBase[0] == nil {
+            discoveredBase[0] = discoveredIdle[0]
+        }
+
+        var bases: [VideoClipEntry] = []
+        bases.reserveCapacity(ReactionStateSpec.numBaseClasses)
+        for i in 0..<ReactionStateSpec.numBaseClasses {
+            if let clip = discoveredBase[i] {
+                bases.append(clip)
+            } else {
+                bases.append(VideoClipEntry(id: "#\(i)", baseIndex: i, tier: 1, filename: "#\(i).mp4"))
+            }
+        }
+
+        self.idleClips = discoveredIdle
+        self.baseReactions = bases
+        self.escalatedVariants = discoveredEscalated
+    }
+
+    static func parseFilename(_ filename: String) -> VideoClipEntry? {
+        guard filename.hasPrefix("#"), filename.lowercased().hasSuffix(".mp4") else { return nil }
+        let stem = String(filename.dropFirst().dropLast(4))
+        let parts = stem.split(separator: "_", omittingEmptySubsequences: true)
+        guard let first = parts.first,
+              let baseIndex = Int(first),
+              0 <= baseIndex && baseIndex < ReactionStateSpec.numBaseClasses else {
+            return nil
+        }
+        if parts.count >= 2, parts[1].count <= 2, let sub = Int(parts[1]), sub >= 2 {
+            return VideoClipEntry(id: "#\(baseIndex)_\(sub)", baseIndex: baseIndex, tier: sub, filename: filename)
+        }
+        return VideoClipEntry(id: "#\(baseIndex)", baseIndex: baseIndex, tier: 1, filename: filename)
+    }
+
+    var allClips: [VideoClipEntry] {
+        var result = idleClips
+        for clip in baseReactions where clip.baseIndex != 0 {
+            result.append(clip)
+            if let variants = escalatedVariants[clip.baseIndex] {
+                result.append(contentsOf: variants)
+            }
+        }
+        return result
+    }
+
+    func resolve(_ state: ReactionStateSpec, idleStep: Int = 0) -> VideoClipEntry {
+        let clamped = max(0, min(ReactionStateSpec.numBaseClasses - 1, state.baseIndex))
+        if clamped == 0 {
+            let idx = abs(idleStep) % idleClips.count
+            return idleClips[idx]
+        }
+        if state.tier >= 2 {
+            if let variants = escalatedVariants[clamped], variants.isEmpty != true {
+                let chosen = variants[min(state.tier - 2, variants.count - 1)]
+                return VideoClipEntry(id: state.id, baseIndex: clamped, tier: state.tier, filename: chosen.filename)
+            }
+            let base = baseReactions[clamped]
+            return VideoClipEntry(id: state.id, baseIndex: clamped, tier: state.tier, filename: base.filename)
+        }
+        return baseReactions[clamped]
+    }
+}
+
 private struct ClipDTO: Encodable {
     let id: String
     let baseIndex: Int
@@ -169,7 +275,7 @@ private struct ClipDTO: Encodable {
     let filename: String
     let videoUrl: String
 
-    init(_ clip: ReactionClip) {
+    init(_ clip: VideoClipEntry) {
         self.id = clip.id
         self.baseIndex = clip.baseIndex
         if clip.baseIndex == 0 {
@@ -220,7 +326,7 @@ private struct CatalogResponseDTO: Encodable {
 
 var port: UInt16 = UInt16(ProcessInfo.processInfo.environment["PORT"] ?? "8080") ?? 8080
 var weightsPath = ProcessInfo.processInfo.environment["WEIGHTS_PATH"] ?? ".tmp/weights.safetensors"
-var resourcesDir = ProcessInfo.processInfo.environment["RESOURCES_DIR"] ?? ReactionCatalog.defaultResourcesDirectory
+var resourcesDir = ProcessInfo.processInfo.environment["RESOURCES_DIR"] ?? ".tmp/resources"
 var webDir = ProcessInfo.processInfo.environment["WEB_DIR"] ?? ".tmp/public"
 
 var argIdx = 1
@@ -246,7 +352,7 @@ while argIdx < args.count {
             resourcesDir = args[argIdx + 1]
             argIdx += 1
         }
-    case "--web":
+    case "--web", "--public":
         if (argIdx + 1) < args.count {
             webDir = args[argIdx + 1]
             argIdx += 1
@@ -268,7 +374,7 @@ print("✓ Hawk weights ready (\(modelWeights.parameterCount) parameters)")
 let sharedNetwork = HawkNetwork(weights: modelWeights)
 let resolvedResourcesDir = resourcesDir
 let resolvedWebDir = webDir
-let serverCatalog = ReactionCatalog(directory: resolvedResourcesDir)
+private let serverVideoMapper = VideoResourceMapper(directory: resolvedResourcesDir)
 
 private func sendHTTPResponse(
     _ fd: Int32,
@@ -293,12 +399,18 @@ private func sendHTTPResponse(
 
 private func handleWebSocketSession(fd: Int32) {
     let sessionId = String(UUID().uuidString.prefix(8))
-    let engine = ReactionStreamEngine(network: sharedNetwork, catalog: serverCatalog)
+    let engine = ReactionStreamEngine(network: sharedNetwork)
     var streamTime: Double = 0.0
+    var idleCounter = 0
     let encoder = JSONEncoder()
     let decoder = JSONDecoder()
 
     func makeMessage(event: CommentEvent, isIdle: Bool, pred: ReactionPrediction, elapsedMs: Double) -> OutgoingWSMessage {
+        if pred.state.baseIndex == 0 && isIdle {
+            idleCounter += 1
+        }
+        let resolvedClip = serverVideoMapper.resolve(pred.state, idleStep: idleCounter)
+        let resolvedBaseClip = serverVideoMapper.resolve(pred.baseState, idleStep: idleCounter)
         return OutgoingWSMessage(
             type: "reaction",
             sessionId: sessionId,
@@ -313,10 +425,10 @@ private func handleWebSocketSession(fd: Int32) {
             velocity: pred.velocity,
             uniqueUsers: pred.uniqueUsers,
             inferenceMs: elapsedMs,
-            clip: ClipDTO(pred.clip),
-            baseClip: ClipDTO(pred.baseClip),
+            clip: ClipDTO(resolvedClip),
+            baseClip: ClipDTO(resolvedBaseClip),
             topCandidates: pred.topCandidates.map {
-                CandidateDTO(baseIndex: $0.baseIndex, id: $0.clip.id, probability: $0.probability)
+                CandidateDTO(baseIndex: $0.baseIndex, id: $0.state.id, probability: $0.probability)
             }
         )
     }
@@ -492,9 +604,9 @@ private func handleClientConnection(fd: Int32) {
         let dto = CatalogResponseDTO(
             status: "ok",
             modelParameters: modelWeights.parameterCount,
-            numBaseClasses: ReactionCatalog.numBaseClasses,
-            totalVideoClips: serverCatalog.allClips.count,
-            clips: serverCatalog.allClips.map { ClipDTO($0) }
+            numBaseClasses: ReactionStateSpec.numBaseClasses,
+            totalVideoClips: serverVideoMapper.allClips.count,
+            clips: serverVideoMapper.allClips.map { ClipDTO($0) }
         )
         let data = (try? JSONEncoder().encode(dto)) ?? Data("{}".utf8)
         sendHTTPResponse(fd, status: "200 OK", contentType: "application/json; charset=utf-8", body: [UInt8](data))

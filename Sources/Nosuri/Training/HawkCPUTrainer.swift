@@ -33,7 +33,7 @@ extension HawkWeights {
         convWidth: Int = 4,
         convRight: Int = 0,
         numLayers: Int = 2,
-        outputDim: Int = ReactionCatalog.numBaseClasses,
+        outputDim: Int = ReactionStateSpec.numBaseClasses,
         seed: UInt64 = 1
     ) -> HawkWeights {
         var rng = SplitMix64(seed: seed)
