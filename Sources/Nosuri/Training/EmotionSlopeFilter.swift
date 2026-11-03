@@ -254,12 +254,12 @@ public struct EmotionSlopeFilter: Sendable {
                     : (1.0 / (1.0 + 3.5 * Float(repeatCount)))
                 let paceFactor: Float = if repeatCount > 0 {
                     1.0
-                } else if dt <= 0.20 {
-                    1.20
-                } else if dt <= 0.65 {
+                } else if dt <= 0.25 {
+                    1.15
+                } else if dt <= 2.8 {
                     1.0
                 } else {
-                    max(0.68, 1.0 - Float(dt - 0.65) * 0.35)
+                    max(0.82, 1.0 - Float(dt - 2.8) * 0.10)
                 }
                 let scBonus = min(0.35, log1pf(Float(max(0, ev.superChatJPY))) / 35.0)
                 let w = max(0.05, (paceFactor + scBonus) * userWeight)
@@ -281,17 +281,27 @@ public struct EmotionSlopeFilter: Sendable {
                 if fromIdx == 0 && toIdx == 0 {
                     // #0 -> #0 (e.g. single-user spam or scattered non-escalating comments)
                     if let hint = events[startIdx + k].reactionIndex, hint > 0 && hint < numClasses {
-                        levels[hint] = min(0.22, 0.18 * progress)
+                        levels[hint] = min(0.18, 0.14 * progress)
                     }
                 } else if fromIdx == toIdx {
                     // Same base class transition (e.g. #5_2 -> #5_3 or #5_3 -> #5_2)
                     levels[toIdx] = startSpec.targetIntensity + (endSpec.targetIntensity - startSpec.targetIntensity) * progress
+                } else if fromIdx == 0 && toIdx > 0 {
+                    // Transition from #0 to an active emotion: keep step 0 slightly below 0.50 when segCount >= 3,
+                    // then rapidly establish the target emotion from step 1 onward regardless of comment speed.
+                    if k == 0 && segCount >= 3 {
+                        levels[toIdx] = min(0.45, endSpec.targetIntensity * 0.48)
+                    } else {
+                        let shaped = min(1.0, 0.68 + 0.32 * powf(progress, 0.60))
+                        levels[toIdx] = endSpec.targetIntensity * shaped
+                    }
                 } else {
                     if fromIdx > 0 {
-                        levels[fromIdx] = startSpec.targetIntensity * max(0.0, 1.0 - 0.90 * progress)
+                        levels[fromIdx] = startSpec.targetIntensity * max(0.0, 1.0 - 0.92 * progress)
                     }
                     if toIdx > 0 {
-                        levels[toIdx] = endSpec.targetIntensity * progress
+                        let shaped = min(1.0, 0.55 + 0.45 * powf(progress, 0.65))
+                        levels[toIdx] = endSpec.targetIntensity * shaped
                     }
                 }
 

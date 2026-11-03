@@ -227,11 +227,11 @@ public final class ReactionStreamEngine: @unchecked Sendable {
                 reset()
             } else {
                 let dt = event.timestamp - lastTs
-                if dt > 2.2 {
+                if dt > 4.5 {
                     hadSilenceGap = true
                     let crowdScale = min(1.0, log1pf(max(0.0, Float(lastUniqueUsers) - 1.0)) / log1pf(30.0))
                     let retentionPer3s: Float = 0.38 + 0.48 * crowdScale
-                    let decayFactor = powf(retentionPer3s, Float(dt - 1.8) / 3.0)
+                    let decayFactor = powf(retentionPer3s, Float(dt - 3.5) / 3.0)
                     state.attenuate(by: decayFactor)
                     previousIntensity *= decayFactor
                     if previousIntensity < 0.24 {
@@ -284,24 +284,33 @@ public final class ReactionStreamEngine: @unchecked Sendable {
             }
         }
 
-        // Preserve active reaction inertia while comments continue without a silence gap.
-        if bestIdx == 0 && previousBaseIndex > 0 && previousBaseIndex < n && !hadSilenceGap {
-            let prevClassProb = probs[previousBaseIndex]
-            if event.superChatJPY > 0 && (prevClassProb >= 0.14 || bestNonIdleProb >= 0.22) {
-                if prevClassProb >= bestNonIdleProb * 0.70 {
+        let canEscalate = uniqueUsers >= 2 || event.superChatJPY > 0
+
+        // Preserve active reaction inertia while comments continue without a silence gap,
+        // or promote the top active emotion when total active mass clearly exceeds #0.
+        if bestIdx == 0 && !hadSilenceGap {
+            if previousBaseIndex > 0 && previousBaseIndex < n {
+                let prevClassProb = probs[previousBaseIndex]
+                if event.superChatJPY > 0 && (prevClassProb >= 0.14 || bestNonIdleProb >= 0.20) {
+                    if prevClassProb >= bestNonIdleProb * 0.70 {
+                        bestIdx = previousBaseIndex
+                        bestProb = prevClassProb
+                    } else {
+                        bestIdx = bestNonIdleIdx
+                        bestProb = bestNonIdleProb
+                    }
+                } else if prevClassProb >= 0.16 {
                     bestIdx = previousBaseIndex
                     bestProb = prevClassProb
-                } else {
+                } else if canEscalate && probs[0] < 0.44 && bestNonIdleProb >= 0.15 {
                     bestIdx = bestNonIdleIdx
                     bestProb = bestNonIdleProb
                 }
-            } else if prevClassProb >= 0.18 {
-                bestIdx = previousBaseIndex
-                bestProb = prevClassProb
+            } else if canEscalate && probs[0] < 0.44 && bestNonIdleProb >= 0.16 {
+                bestIdx = bestNonIdleIdx
+                bestProb = bestNonIdleProb
             }
         }
-
-        let canEscalate = uniqueUsers >= 2 || event.superChatJPY > 0
         if bestIdx > 0 && bestIdx == previousBaseIndex && !hadSilenceGap && canEscalate {
             let crowdBoost: Float = uniqueUsers > lastUniqueUsers ? 0.03 : 0.0
             let scBoost: Float = event.superChatJPY > 0 ? 0.05 : 0.0

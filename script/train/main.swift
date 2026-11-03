@@ -61,7 +61,7 @@ while argIdx < args.count {
             datasetPaths.append(args[argIdx + 1])
             argIdx += 1
         }
-    case "--export-weights":
+    case "-o", "--output", "--export-weights":
         if (argIdx + 1) < args.count {
             exportWeightsPath = args[argIdx + 1]
             argIdx += 1

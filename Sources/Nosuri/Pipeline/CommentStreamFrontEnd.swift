@@ -17,18 +17,18 @@ public struct ReactionStateSpec: Sendable, Equatable {
         self.id = (clampedBase == 0 || clampedTier == 1) ? "#\(clampedBase)" : "#\(clampedBase)_\(clampedTier)"
     }
 
-    /// Target active probability corresponding to this state tier (`#0` = 0.0, `#X` = 0.56, `#X_2` = 0.74, `#X_3` = 0.94).
+    /// Target active probability corresponding to this state tier (`#0` = 0.0, `#X` = 0.78, `#X_2` = 0.90, `#X_3` = 0.97).
     public var targetIntensity: Float {
         if baseIndex == 0 {
             return 0.0
         }
         switch tier {
         case 1:
-            return 0.56
+            return 0.78
         case 2:
-            return 0.74
+            return 0.90
         default:
-            return 0.94
+            return 0.97
         }
     }
 
@@ -529,9 +529,9 @@ public final class CommentStreamFrontEnd: @unchecked Sendable {
             if let prevActive = lastActiveCommentTime {
                 dt = max(0.05, now - prevActive)
             }
-            if dt > 0.75 {
+            if dt > 3.2 {
                 let crowdScale = min(1.0, log1pf(max(0.0, activeCrowdUsers - 1.0)) / log1pf(30.0))
-                let gapDecay = powf(0.82 + 0.12 * crowdScale, Float(min(4.0, dt - 0.65)))
+                let gapDecay = powf(0.84 + 0.11 * crowdScale, Float(min(4.0, dt - 3.0)))
                 crowdMomentum *= gapDecay
             }
             lastActiveCommentTime = now
@@ -563,9 +563,9 @@ public final class CommentStreamFrontEnd: @unchecked Sendable {
             let userWeight: Float = (sameUserRepeatCount == 0)
                 ? 1.0
                 : (1.0 / (1.0 + 3.5 * Float(sameUserRepeatCount)))
-            let paceFactor = min(1.2, max(0.65, Float(0.75 / max(0.15, dt))))
-            let stepIncrement = (0.20 * paceFactor + 0.08 * scLog) * userWeight
-            crowdMomentum = min(1.0, crowdMomentum * 0.94 + stepIncrement)
+            let paceFactor = min(1.25, max(0.82, Float(1.5 / max(0.20, dt))))
+            let stepIncrement = (0.22 * paceFactor + 0.08 * scLog) * userWeight
+            crowdMomentum = min(1.0, crowdMomentum * 0.95 + stepIncrement)
         }
 
         let scalars = Array(event.text.unicodeScalars)
@@ -580,7 +580,7 @@ public final class CommentStreamFrontEnd: @unchecked Sendable {
         frame[4] = crowdMomentum
         frame[5] = crowdScale
         frame[6] = isIdleTick ? 0.0 : (sameUserRepeatCount == 0 ? 1.0 : (1.0 / Float(1 + sameUserRepeatCount)))
-        frame[7] = min(1.0, Float(dt) / 2.0)
+        frame[7] = min(1.0, Float(dt) / 5.0)
 
         // [8..<80]: L2-normalized signed character 1-gram, 2-gram, and 3-gram projections (72 channels).
         if scalarCount > 0 {
