@@ -41,8 +41,8 @@ if datasetPath.isEmpty {
     exit(1)
 }
 
-guard let events = CommentEvent.loadList(fromFile: datasetPath), events.isEmpty != true else {
-    print("error: cannot load dataset from \(datasetPath)")
+guard let scenarios = CommentEvent.loadScenarios(fromFile: datasetPath), scenarios.isEmpty != true else {
+    print("error: cannot load scenarios from \(datasetPath)")
     exit(1)
 }
 
@@ -54,20 +54,51 @@ guard let weights = try? HawkWeights.load(from: URL(fileURLWithPath: weightsPath
 print("==================================================")
 print("=== nosuri live reaction stream ===")
 print("==================================================")
-print("weights: \(weightsPath) (\(weights.parameterCount) parameters)")
-print("dataset: \(datasetPath) (\(events.count) events)")
+print("weights:   \(weightsPath) (\(weights.parameterCount) parameters)")
+print("scenarios: \(datasetPath) (\(scenarios.count) scenarios)")
 
 let catalog = ReactionCatalog(directory: resourcesDir)
 let engine = ReactionStreamEngine(network: HawkNetwork(weights: weights), catalog: catalog)
 
-for ev in events {
-    let pred = engine.pushDetailed(ev)
-    let clip = pred.clip
-    let userPrefix = ev.user.isEmpty ? "" : "@\(ev.user): "
-    let scText = ev.superChatJPY > 0 ? " [¥\(ev.superChatJPY)]" : ""
-    let phaseText = pred.phase == "decaying" ? " [decay \(Int(pred.intensity * 100))%]" : (pred.escalated ? " (\(pred.baseClip.id)->\(clip.id))" : "")
-    let commentDisplay = ev.text.isEmpty ? "(idle)" : "\(userPrefix)\(ev.text)"
-    print(String(format: "[t=%5.2fs | u=%2d | v=%4.2f/s] %@%@ -> %@ (%@)%@",
-                 ev.timestamp, pred.uniqueUsers, pred.velocity, commentDisplay, scText,
-                 clip.id, clip.filename, phaseText))
+var prevScenario: ReactionScenario? = nil
+for scenario in scenarios {
+    let continuesChain = if let prev = prevScenario {
+        scenario.fromState.baseIndex != 0 && prev.toState == scenario.fromState
+    } else {
+        false
+    }
+    if !continuesChain {
+        engine.reset()
+    }
+    prevScenario = scenario
+
+    let noteSuffix = scenario.note.isEmpty ? "" : " — \(scenario.note)"
+    print("\n--- [\(scenario.reactionState)]\(noteSuffix) ---")
+
+    var lastTs: Double = 0.0
+    for ev in scenario.data {
+        lastTs = ev.timestamp
+        let pred = engine.ingest(ev)
+        let clip = pred.clip
+        let userPrefix = ev.user.isEmpty ? "" : "@\(ev.user): "
+        let scText = ev.superChatJPY > 0 ? " [¥\(ev.superChatJPY)]" : ""
+        let phaseText = pred.phase == "decaying" ? " [decay \(Int(pred.intensity * 100))%]" : (pred.escalated ? " (\(pred.baseClip.id)->\(clip.id))" : "")
+        print(String(format: "[t=%5.2fs | u=%2d | v=%4.2f/s] %@%@%@ -> %@ (%@)%@",
+                     ev.timestamp, pred.uniqueUsers, pred.velocity, userPrefix, ev.text, scText,
+                     clip.id, clip.filename, phaseText))
+    }
+
+    // Query time-based decay at +3s, +6s, +9s after the last comment without feeding any dummy events.
+    if scenario.toState.baseIndex > 0 {
+        for offset in [3.0, 6.0, 9.0, 12.0] {
+            let queryTs = lastTs + offset
+            let pred = engine.state(at: queryTs)
+            let clip = pred.clip
+            let phaseText = pred.phase == "decaying" ? " [decay \(Int(pred.intensity * 100))%]" : ""
+            print(String(format: "[t=%5.2fs | u=%2d | v=%4.2f/s] (state@+%.0fs) -> %@ (%@)%@",
+                         queryTs, pred.uniqueUsers, pred.velocity, offset,
+                         clip.id, clip.filename, phaseText))
+            if pred.clip.baseIndex == 0 { break }
+        }
+    }
 }

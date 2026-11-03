@@ -46,8 +46,9 @@ public struct ReactionPrediction: Sendable, Equatable {
     }
 }
 
-/// Stateful streaming inference wrapper: extracts one feature frame per `CommentEvent`, advances
-/// `HawkNetwork.State`, resolves virtual `#X_y` tiers (`#X`, `#X_2`, `#X_3`), and tracks emotional decay.
+/// Stateful streaming inference wrapper: ingests incoming `CommentEvent` items into `HawkNetwork.State`,
+/// and evaluates the reaction state (including time-based emotional decay from the last comment timestamp)
+/// at any requested timestamp via `state(at:)`.
 public final class ReactionStreamEngine: @unchecked Sendable {
     public let network: HawkNetwork
     public let frontEnd: CommentStreamFrontEnd
@@ -55,16 +56,20 @@ public final class ReactionStreamEngine: @unchecked Sendable {
     public private(set) var state: HawkNetwork.State
     public let escalationProbability: Float
     private var idleStepCount: Int = 0
-    private var lastTimestamp: Double? = nil
+    private var lastCommentTimestamp: Double? = nil
     private var previousBaseIndex: Int = 0
     private var previousIntensity: Float = 0.0
     private var previousTier: Int = 1
+    private var lastVelocity: Float = 0.0
+    private var lastUniqueUsers: Int = 0
+    private var lastSuperChatJPY: Int = 0
+    private var lastProbabilities: [Float] = []
 
     public init(
         network: HawkNetwork,
         catalog: ReactionCatalog = .shared,
         windowSeconds: Double = 12.0,
-        escalationProbability: Float = 0.62
+        escalationProbability: Float = 0.64
     ) {
         self.network = network
         self.catalog = catalog
@@ -77,55 +82,210 @@ public final class ReactionStreamEngine: @unchecked Sendable {
         frontEnd.reset()
         state = network.makeState()
         idleStepCount = 0
-        lastTimestamp = nil
+        lastCommentTimestamp = nil
         previousBaseIndex = 0
         previousIntensity = 0.0
         previousTier = 1
+        lastVelocity = 0.0
+        lastUniqueUsers = 0
+        lastSuperChatJPY = 0
+        lastProbabilities = []
     }
 
     public func push(_ event: CommentEvent) -> ReactionClip {
         return pushDetailed(event).clip
     }
 
-    public func pushDetailed(_ event: CommentEvent, topK: Int = 5) -> ReactionPrediction {
-        if let last = lastTimestamp, event.timestamp < last {
-            frontEnd.reset()
-            state = network.makeState()
-            previousBaseIndex = 0
-            previousIntensity = 0.0
-            previousTier = 1
-        }
-        lastTimestamp = event.timestamp
-        let frame = frontEnd.extractFrame(for: event)
-        let isIdleTick = event.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && event.superChatJPY <= 0
+    /// Ingests a comment and returns the reaction state at `event.timestamp`.
+    public func ingest(_ event: CommentEvent, topK: Int = 5) -> ReactionPrediction {
+        return pushDetailed(event, topK: topK)
+    }
 
-        let logProbs = network.push([frame], state: state)
-        if isIdleTick {
-            idleStepCount += 1
+    /// Computes the reaction state at an arbitrary `timestamp` without feeding dummy idle events.
+    /// Uses `timestamp - lastCommentTimestamp` and the active crowd size to calculate emotional decay.
+    public func state(at timestamp: Double, topK: Int = 5) -> ReactionPrediction {
+        guard let lastTs = lastCommentTimestamp else {
+            let idleClip = catalog.resolveClip(baseIndex: 0, commentVelocity: 0.0, superChatJPY: 0, idleStep: idleStepCount)
+            return ReactionPrediction(
+                clip: idleClip,
+                baseClip: idleClip,
+                escalated: false,
+                phase: "idle",
+                intensity: 1.0,
+                velocity: 0.0,
+                uniqueUsers: 0,
+                superChatJPY: 0,
+                topCandidates: [ReactionCandidate(baseIndex: 0, clip: idleClip, probability: 1.0)]
+            )
         }
+
+        let elapsed = max(0.0, timestamp - lastTs)
+        let crowdScale = min(1.0, log1pf(max(0.0, Float(lastUniqueUsers) - 1.0)) / log1pf(30.0))
+
+        if previousBaseIndex <= 0 || previousIntensity <= 0.0 {
+            let step = idleStepCount + max(0, Int(elapsed / 3.0))
+            let idleClip = catalog.resolveClip(baseIndex: 0, commentVelocity: 0.0, superChatJPY: 0, idleStep: step)
+            return ReactionPrediction(
+                clip: idleClip,
+                baseClip: idleClip,
+                escalated: false,
+                phase: "idle",
+                intensity: 1.0,
+                velocity: 0.0,
+                uniqueUsers: lastUniqueUsers,
+                superChatJPY: 0,
+                topCandidates: [ReactionCandidate(baseIndex: 0, clip: idleClip, probability: 1.0)]
+            )
+        }
+
+        let retentionPer3s: Float = 0.38 + 0.48 * crowdScale
+        let decaySteps: Float = elapsed > 0.8 ? Float(elapsed - 0.8) / 3.0 : 0.0
+        let factor: Float = decaySteps > 0.0 ? powf(retentionPer3s, decaySteps) : 1.0
+        let decayedIntensity = previousIntensity * factor
+        let decayedVelocity = lastVelocity * powf(0.55 + 0.30 * crowdScale, decaySteps)
+        let decayedUsers = max(0, Int((Float(lastUniqueUsers) * powf(0.60 + 0.28 * crowdScale, decaySteps)).rounded()))
+
+        if decayedIntensity < 0.24 {
+            let step = idleStepCount + max(1, Int(elapsed / 3.0))
+            let idleClip = catalog.resolveClip(baseIndex: 0, commentVelocity: decayedVelocity, superChatJPY: 0, idleStep: step)
+            let idleProb = max(0.5, 1.0 - decayedIntensity)
+            let prevClip = catalog.resolveClip(baseIndex: previousBaseIndex, commentVelocity: 0.0, superChatJPY: 0, virtualTier: 1)
+            return ReactionPrediction(
+                clip: idleClip,
+                baseClip: idleClip,
+                escalated: false,
+                phase: "idle",
+                intensity: idleProb,
+                velocity: decayedVelocity,
+                uniqueUsers: decayedUsers,
+                superChatJPY: 0,
+                topCandidates: [
+                    ReactionCandidate(baseIndex: 0, clip: idleClip, probability: idleProb),
+                    ReactionCandidate(baseIndex: previousBaseIndex, clip: prevClip, probability: decayedIntensity)
+                ]
+            )
+        }
+
+        let isDecaying = elapsed > 0.8
+        let tier: Int = if isDecaying {
+            if decayedIntensity >= 0.82 {
+                min(previousTier, 3)
+            } else if decayedIntensity >= 0.60 {
+                min(previousTier, 2)
+            } else {
+                1
+            }
+        } else {
+            previousTier
+        }
+
+        let phase: String = if isDecaying {
+            "decaying"
+        } else if tier >= 2 {
+            "peak"
+        } else {
+            "rising"
+        }
+
+        let baseClip = catalog.resolveClip(
+            baseIndex: previousBaseIndex,
+            commentVelocity: 0.0,
+            superChatJPY: 0,
+            idleStep: idleStepCount,
+            virtualTier: 1
+        )
+        let resolvedClip = catalog.resolveClip(
+            baseIndex: previousBaseIndex,
+            commentVelocity: decayedVelocity,
+            superChatJPY: isDecaying ? 0 : lastSuperChatJPY,
+            idleStep: idleStepCount,
+            virtualTier: tier
+        )
+        let idleClip = catalog.resolveClip(
+            baseIndex: 0,
+            commentVelocity: decayedVelocity,
+            superChatJPY: 0,
+            idleStep: idleStepCount
+        )
+
+        var candidates: [ReactionCandidate] = [
+            ReactionCandidate(baseIndex: previousBaseIndex, clip: resolvedClip, probability: decayedIntensity),
+            ReactionCandidate(baseIndex: 0, clip: idleClip, probability: max(0.0, 1.0 - decayedIntensity))
+        ]
+        if lastProbabilities.isEmpty != true {
+            for i in 1..<lastProbabilities.count where i != previousBaseIndex && candidates.count < max(1, topK) {
+                let p = lastProbabilities[i] * factor
+                if p > 0.01 {
+                    let cClip = catalog.resolveClip(baseIndex: i, commentVelocity: 0.0, superChatJPY: 0, virtualTier: 1)
+                    candidates.append(ReactionCandidate(baseIndex: i, clip: cClip, probability: p))
+                }
+            }
+        }
+        candidates.sort { $0.probability > $1.probability }
+
+        return ReactionPrediction(
+            clip: resolvedClip,
+            baseClip: baseClip,
+            escalated: resolvedClip.baseIndex > 0 && resolvedClip.tier >= 2,
+            phase: phase,
+            intensity: decayedIntensity,
+            velocity: decayedVelocity,
+            uniqueUsers: decayedUsers,
+            superChatJPY: isDecaying ? 0 : lastSuperChatJPY,
+            topCandidates: Array(candidates.prefix(max(1, topK)))
+        )
+    }
+
+    public func pushDetailed(_ event: CommentEvent, topK: Int = 5) -> ReactionPrediction {
+        let isIdleQuery = event.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && event.superChatJPY <= 0
+        if isIdleQuery {
+            idleStepCount += 1
+            let queryTime = if let lastTs = lastCommentTimestamp, event.timestamp <= lastTs {
+                lastTs + 3.0 * Double(idleStepCount)
+            } else {
+                event.timestamp
+            }
+            return state(at: queryTime, topK: topK)
+        }
+
+        var hadSilenceGap = false
+        if let lastTs = lastCommentTimestamp {
+            if event.timestamp < lastTs {
+                reset()
+            } else {
+                let dt = event.timestamp - lastTs
+                if dt > 2.2 {
+                    hadSilenceGap = true
+                    let crowdScale = min(1.0, log1pf(max(0.0, Float(lastUniqueUsers) - 1.0)) / log1pf(30.0))
+                    let retentionPer3s: Float = 0.38 + 0.48 * crowdScale
+                    let decayFactor = powf(retentionPer3s, Float(dt - 1.8) / 3.0)
+                    state.attenuate(by: decayFactor)
+                    previousIntensity *= decayFactor
+                    if previousIntensity < 0.24 {
+                        previousBaseIndex = 0
+                        previousIntensity = 0.0
+                        previousTier = 1
+                    } else if previousIntensity < 0.60 {
+                        previousTier = 1
+                    } else if previousIntensity < 0.82 {
+                        previousTier = min(previousTier, 2)
+                    }
+                }
+            }
+        }
+
+        lastCommentTimestamp = event.timestamp
+        idleStepCount = 0
+
+        let frame = frontEnd.extractFrame(for: event)
+        let logProbs = network.push([frame], state: state)
 
         let velocity = frontEnd.currentVelocity
         let uniqueUsers = frontEnd.currentUniqueUsers
         let classCount = ReactionCatalog.numBaseClasses
 
         guard let scores = logProbs.last, scores.isEmpty != true else {
-            let idleClip = catalog.resolveClip(
-                baseIndex: 0,
-                commentVelocity: velocity,
-                superChatJPY: event.superChatJPY,
-                idleStep: idleStepCount
-            )
-            return ReactionPrediction(
-                clip: idleClip,
-                baseClip: idleClip,
-                escalated: false,
-                phase: "idle",
-                intensity: 0.0,
-                velocity: velocity,
-                uniqueUsers: uniqueUsers,
-                superChatJPY: event.superChatJPY,
-                topCandidates: [ReactionCandidate(baseIndex: 0, clip: idleClip, probability: 1.0)]
-            )
+            return state(at: event.timestamp, topK: topK)
         }
 
         let n = min(scores.count, classCount)
@@ -150,49 +310,54 @@ public final class ReactionStreamEngine: @unchecked Sendable {
                 bestNonIdleIdx = i
             }
         }
-        indexed.sort { $0.prob > $1.prob }
 
-        // Preserve active reaction inertia during SuperChat or gradual decay tail (#X_2 -> #X -> #0).
-        if bestIdx == 0 && previousBaseIndex > 0 && previousBaseIndex < n {
+        // Preserve active reaction inertia while comments continue without a silence gap.
+        if bestIdx == 0 && previousBaseIndex > 0 && previousBaseIndex < n && !hadSilenceGap {
             let prevClassProb = probs[previousBaseIndex]
-            if event.superChatJPY > 0 && (prevClassProb >= 0.16 || bestNonIdleProb >= 0.22) {
-                if prevClassProb >= bestNonIdleProb * 0.75 {
+            if event.superChatJPY > 0 && (prevClassProb >= 0.14 || bestNonIdleProb >= 0.22) {
+                if prevClassProb >= bestNonIdleProb * 0.70 {
                     bestIdx = previousBaseIndex
-                    bestProb = max(prevClassProb, previousIntensity * 0.90)
+                    bestProb = prevClassProb
                 } else {
                     bestIdx = bestNonIdleIdx
                     bestProb = bestNonIdleProb
                 }
-            } else if prevClassProb >= 0.24 {
+            } else if prevClassProb >= 0.18 {
                 bestIdx = previousBaseIndex
                 bestProb = prevClassProb
             }
         }
 
-        let isDecaying = bestIdx > 0 && (isIdleTick || (bestIdx == previousBaseIndex && bestProb < previousIntensity - 0.03))
-
-        let virtualTier: Int = if bestIdx <= 0 {
-            1
-        } else if isDecaying {
-            if bestProb >= 0.65 {
-                min(previousTier, 2)
-            } else {
-                1
+        let canEscalate = uniqueUsers >= 2 || event.superChatJPY > 0
+        if bestIdx > 0 && bestIdx == previousBaseIndex && !hadSilenceGap && canEscalate {
+            let crowdBoost: Float = uniqueUsers > lastUniqueUsers ? 0.03 : 0.0
+            let scBoost: Float = event.superChatJPY > 0 ? 0.05 : 0.0
+            bestProb = max(bestProb, min(0.96, previousIntensity + crowdBoost + scBoost))
+            probs[bestIdx] = bestProb
+            if let pos = indexed.firstIndex(where: { $0.index == bestIdx }) {
+                indexed[pos].prob = bestProb
             }
-        } else if bestProb >= 0.80 && (uniqueUsers >= 5 || event.superChatJPY >= 1000) {
+        }
+        indexed.sort { $0.prob > $1.prob }
+
+        let rawTier: Int = if bestIdx <= 0 || !canEscalate {
+            1
+        } else if bestProb >= 0.82 && (uniqueUsers >= 4 || event.superChatJPY >= 1000) {
             3
-        } else if bestProb >= escalationProbability && (uniqueUsers >= 4 || event.superChatJPY >= 1000) {
+        } else if bestProb >= escalationProbability && (uniqueUsers >= 3 || event.superChatJPY >= 500) {
             2
-        } else if bestIdx == previousBaseIndex && previousTier >= 2 && bestProb >= 0.55 && uniqueUsers >= 4 {
-            previousTier
         } else {
             1
         }
 
+        let virtualTier: Int = if bestIdx > 0 && bestIdx == previousBaseIndex && !hadSilenceGap && canEscalate {
+            max(rawTier, previousTier)
+        } else {
+            rawTier
+        }
+
         let phase: String = if bestIdx <= 0 {
             "idle"
-        } else if isDecaying {
-            "decaying"
         } else if virtualTier >= 2 {
             "peak"
         } else {
@@ -202,6 +367,10 @@ public final class ReactionStreamEngine: @unchecked Sendable {
         previousBaseIndex = bestIdx
         previousIntensity = bestIdx > 0 ? bestProb : 0.0
         previousTier = virtualTier
+        lastVelocity = velocity
+        lastUniqueUsers = uniqueUsers
+        lastSuperChatJPY = event.superChatJPY
+        lastProbabilities = probs
 
         let k = max(1, min(topK, indexed.count))
         let topCandidates: [ReactionCandidate] = indexed.prefix(k).map { item in

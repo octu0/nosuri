@@ -34,7 +34,7 @@ while argIdx < args.count {
     case "-h", "--help":
         print("Usage: train [-d <dataset_or_dir> ...] [options]")
         print("Options:")
-        print("  -d, --dataset <path>         Dataset file (*_comments.jsonl) or directory (default: .tmp)")
+        print("  -d, --dataset <path>         Dataset file (*.json) or directory (default: .tmp)")
         print("  -b, --batch-size <Int>       Mini-batch size (default: 16)")
         print("  -e, --epochs <Int>           Number of epochs (default: 30; 0 = eval only)")
         print("  --step-gain <Float>          Emotion slope filter step gain (default: 0.22)")
@@ -83,17 +83,20 @@ if datasetPaths.isEmpty {
     datasetPaths = [".tmp"]
 }
 
-let datasets = CommentEvent.loadDatasets(from: datasetPaths)
+let datasets = CommentEvent.loadScenarioDatasets(from: datasetPaths)
 if datasets.isEmpty {
-    print("error: no dataset files (*_comments.jsonl) found in \(datasetPaths.joined(separator: ", "))")
+    print("error: no dataset files (*.json) found in \(datasetPaths.joined(separator: ", "))")
     exit(1)
 }
 
 print("dataset files (\(datasets.count)):")
+var totalScenarioCount = 0
 var totalEventCount = 0
 for ds in datasets {
-    print("  - \(ds.source) (\(ds.events.count) events)")
-    totalEventCount += ds.events.count
+    let evCount = ds.scenarios.reduce(0) { $0 + $1.data.count }
+    print("  - \(ds.source) (\(ds.scenarios.count) scenarios, \(evCount) comments)")
+    totalScenarioCount += ds.scenarios.count
+    totalEventCount += evCount
 }
 
 let frontEnd = CommentStreamFrontEnd()
@@ -107,33 +110,15 @@ var targetDistributions: [[[Float]]] = []
 var dominantTargets: [[Int]] = []
 
 for ds in datasets {
-    var episodes: [[CommentEvent]] = []
-    var currentEpisode: [CommentEvent] = []
-    var prevTs: Double = -1.0
-
-    for ev in ds.events {
-        if currentEpisode.isEmpty != true && ev.timestamp < prevTs {
-            episodes.append(currentEpisode)
-            currentEpisode = []
-        }
-        currentEpisode.append(ev)
-        prevTs = ev.timestamp
-    }
-    if currentEpisode.isEmpty != true {
-        episodes.append(currentEpisode)
-    }
-
-    for ep in episodes {
-        let frames = frontEnd.extractFrames(for: ep)
-        let dists = slopeFilter.filter(events: ep)
-        let doms = slopeFilter.dominantTargets(events: ep)
-        sequences.append(frames)
-        targetDistributions.append(dists)
-        dominantTargets.append(doms)
+    let built = slopeFilter.buildTrainingEpisodes(scenarios: ds.scenarios, frontEnd: frontEnd)
+    for ep in built {
+        sequences.append(ep.frames)
+        targetDistributions.append(ep.distributions)
+        dominantTargets.append(ep.dominants)
     }
 }
 
-print("loaded \(totalEventCount) events across \(sequences.count) sequences (slope stepGain=\(stepGain))")
+print("loaded \(totalScenarioCount) scenarios (\(totalEventCount) comments) -> \(sequences.count) training episodes")
 print("inputDim: \(CommentStreamFrontEnd.inputDim) / reaction classes: \(ReactionCatalog.numBaseClasses)")
 
 var initialWeights = HawkWeights.makeRandom(

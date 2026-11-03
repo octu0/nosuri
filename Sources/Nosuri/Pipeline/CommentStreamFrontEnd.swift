@@ -1,5 +1,91 @@
 import Foundation
 
+/// Represents one node in a `reaction_state` transition string such as `"#0"`, `"#5"`, `"#5_2"`, `"#5_3"`.
+public struct ReactionStateSpec: Sendable, Equatable {
+    public let id: String
+    public let baseIndex: Int
+    public let tier: Int
+
+    public init(baseIndex: Int, tier: Int = 1) {
+        let clampedBase = max(0, min(ReactionCatalog.numBaseClasses - 1, baseIndex))
+        let clampedTier = clampedBase == 0 ? 1 : max(1, min(3, tier))
+        self.baseIndex = clampedBase
+        self.tier = clampedTier
+        self.id = (clampedBase == 0 || clampedTier == 1) ? "#\(clampedBase)" : "#\(clampedBase)_\(clampedTier)"
+    }
+
+    /// Target active probability corresponding to this state tier (`#0` = 0.0, `#X` = 0.56, `#X_2` = 0.74, `#X_3` = 0.94).
+    public var targetIntensity: Float {
+        if baseIndex == 0 {
+            return 0.0
+        }
+        switch tier {
+        case 1:
+            return 0.56
+        case 2:
+            return 0.74
+        default:
+            return 0.94
+        }
+    }
+
+    public static func parse(_ raw: String) -> ReactionStateSpec {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let withoutHash = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        let parts = withoutHash.split(separator: "_", omittingEmptySubsequences: true)
+        guard let first = parts.first, let base = Int(first) else {
+            return ReactionStateSpec(baseIndex: 0, tier: 1)
+        }
+        let tier = (parts.count >= 2 ? Int(parts[1]) : nil) ?? 1
+        return ReactionStateSpec(baseIndex: base, tier: tier)
+    }
+
+    public static func parseTransition(_ raw: String) -> [ReactionStateSpec] {
+        let segments = raw.components(separatedBy: "->")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.isEmpty != true }
+        if segments.isEmpty {
+            return [ReactionStateSpec(baseIndex: 0), ReactionStateSpec(baseIndex: 0)]
+        }
+        if segments.count == 1 {
+            return [ReactionStateSpec(baseIndex: 0), parse(segments[0])]
+        }
+        return segments.map { parse($0) }
+    }
+}
+
+/// Represents a comment stream transition scenario:
+/// ```json
+/// {
+///   "reaction_state": "#0->#10_2",
+///   "note": "複数人が短時間に笑いのコメントを投稿し、通常状態(#0)から大爆笑(#10_2)に変わる",
+///   "data": [
+///     {"timestamp": 1.0, "user": "u1", "superchat": 0, "text": "..."}
+///   ]
+/// }
+/// ```
+public struct ReactionScenario: Sendable, Equatable {
+    public let reactionState: String
+    public let note: String
+    public let data: [CommentEvent]
+    public let states: [ReactionStateSpec]
+
+    public var fromState: ReactionStateSpec {
+        return states.first ?? ReactionStateSpec(baseIndex: 0)
+    }
+
+    public var toState: ReactionStateSpec {
+        return states.last ?? ReactionStateSpec(baseIndex: 0)
+    }
+
+    public init(reactionState: String, note: String = "", data: [CommentEvent]) {
+        self.reactionState = reactionState
+        self.note = note
+        self.data = data
+        self.states = ReactionStateSpec.parseTransition(reactionState)
+    }
+}
+
 public struct CommentEvent: Codable, Sendable, Equatable {
     public let timestamp: Double
     public let user: String
@@ -22,7 +108,7 @@ public struct CommentEvent: Codable, Sendable, Equatable {
     }
 
     /// Resolves one or more file or directory paths into individual dataset file paths,
-    /// preferring `*_comments.jsonl` files when scanning a directory.
+    /// preferring `*.json` scenario files (or `*_comments.jsonl` when no `.json` files exist).
     public static func resolveDatasetFiles(from paths: [String]) -> [String] {
         var resolved: [String] = []
         let fm = FileManager.default
@@ -31,13 +117,16 @@ public struct CommentEvent: Codable, Sendable, Equatable {
             guard fm.fileExists(atPath: rawPath, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
                 let entries = (try? fm.contentsOfDirectory(atPath: rawPath))?.sorted() ?? []
+                let jsonFiles = entries.filter { $0.lowercased().hasSuffix(".json") }
                 let commentJsonls = entries.filter { $0.hasSuffix("_comments.jsonl") }
-                let selected: [String] = if commentJsonls.isEmpty != true {
+                let selected: [String] = if jsonFiles.isEmpty != true {
+                    jsonFiles
+                } else if commentJsonls.isEmpty != true {
                     commentJsonls
                 } else {
                     entries.filter {
                         let lower = $0.lowercased()
-                        return lower.hasSuffix(".jsonl") || lower.hasSuffix(".json") || lower.hasSuffix(".tsv") || lower.hasSuffix(".csv")
+                        return lower.hasSuffix(".jsonl") || lower.hasSuffix(".tsv") || lower.hasSuffix(".csv")
                     }
                 }
                 for name in selected {
@@ -50,7 +139,111 @@ public struct CommentEvent: Codable, Sendable, Equatable {
         return resolved
     }
 
-    /// Loads multiple dataset files (or directories containing `*_comments.jsonl` files) separately.
+    /// Loads scenario datasets (`*.json` or fallback `.jsonl`) from paths.
+    public static func loadScenarioDatasets(from paths: [String]) -> [(source: String, scenarios: [ReactionScenario])] {
+        let files = resolveDatasetFiles(from: paths)
+        var results: [(source: String, scenarios: [ReactionScenario])] = []
+        for file in files {
+            if let scenarios = loadScenarios(fromFile: file), scenarios.isEmpty != true {
+                results.append((source: file, scenarios: scenarios))
+            }
+        }
+        return results
+    }
+
+    /// Loads `ReactionScenario` items from a `.json` file (or wraps legacy event lists into scenarios).
+    public static func loadScenarios(fromFile path: String) -> [ReactionScenario]? {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
+            let files = resolveDatasetFiles(from: [path])
+            if files.isEmpty { return nil }
+            var combined: [ReactionScenario] = []
+            for file in files {
+                if let list = loadScenarios(fromFile: file) {
+                    combined.append(contentsOf: list)
+                }
+            }
+            return combined
+        }
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return [] }
+
+        if let jsonData = trimmed.data(using: .utf8),
+           let root = try? JSONSerialization.jsonObject(with: jsonData) {
+            if let rawArray = root as? [[String: Any]],
+               let first = rawArray.first,
+               (first["reaction_state"] != nil || first["reactionState"] != nil || first["data"] != nil) {
+                return rawArray.compactMap { parseScenarioDictionary($0) }
+            }
+            if let rawDict = root as? [String: Any] {
+                if let nested = (rawDict["scenarios"] ?? rawDict["items"] ?? rawDict["episodes"]) as? [[String: Any]] {
+                    return nested.compactMap { parseScenarioDictionary($0) }
+                }
+                if let single = parseScenarioDictionary(rawDict) {
+                    return [single]
+                }
+            }
+        }
+
+        // Legacy fallback: group consecutive events into scenarios when timestamp resets.
+        guard let events = loadList(fromFile: path), events.isEmpty != true else {
+            return nil
+        }
+        var scenarios: [ReactionScenario] = []
+        var chunk: [CommentEvent] = []
+        var prevTs: Double = -1.0
+        for ev in events {
+            if chunk.isEmpty != true && ev.timestamp < prevTs {
+                scenarios.append(makeLegacyScenario(from: chunk))
+                chunk = []
+            }
+            chunk.append(ev)
+            prevTs = ev.timestamp
+        }
+        if chunk.isEmpty != true {
+            scenarios.append(makeLegacyScenario(from: chunk))
+        }
+        return scenarios
+    }
+
+    private static func parseScenarioDictionary(_ dict: [String: Any]) -> ReactionScenario? {
+        let stateStr = (dict["reaction_state"] ?? dict["reactionState"] ?? dict["state"]) as? String ?? "#0->#0"
+        let note = (dict["note"] ?? dict["description"] ?? dict["comment"]) as? String ?? ""
+        guard let rawData = (dict["data"] ?? dict["comments"] ?? dict["events"]) as? [[String: Any]] else {
+            return nil
+        }
+        let parsedStates = ReactionStateSpec.parseTransition(stateStr)
+        let targetBase = parsedStates.last?.baseIndex ?? 0
+        var events: [CommentEvent] = []
+        events.reserveCapacity(rawData.count)
+        var autoTime = 1.0
+        for item in rawData {
+            if let ev = parseDictionary(item, defaultTimestamp: autoTime, fallbackReactionIndex: targetBase) {
+                let textTrimmed = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if textTrimmed.isEmpty && ev.superChatJPY <= 0 {
+                    continue
+                }
+                autoTime = ev.timestamp + 0.5
+                events.append(ev)
+            }
+        }
+        if events.isEmpty { return nil }
+        return ReactionScenario(reactionState: stateStr, note: note, data: events)
+    }
+
+    private static func makeLegacyScenario(from events: [CommentEvent]) -> ReactionScenario {
+        let activeEvents = events.filter {
+            $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != true || $0.superChatJPY > 0
+        }
+        let targetIdx = activeEvents.compactMap(\.reactionIndex).last { $0 > 0 } ?? 0
+        let stateStr = targetIdx > 0 ? "#0->#\(targetIdx)" : "#0->#0"
+        return ReactionScenario(reactionState: stateStr, note: "", data: activeEvents.isEmpty ? events : activeEvents)
+    }
+
+    /// Loads multiple dataset files separately as flat `[CommentEvent]` lists.
     public static func loadDatasets(from paths: [String]) -> [(source: String, events: [CommentEvent])] {
         let files = resolveDatasetFiles(from: paths)
         var results: [(source: String, events: [CommentEvent])] = []
@@ -62,7 +255,7 @@ public struct CommentEvent: Codable, Sendable, Equatable {
         return results
     }
 
-    /// Loads comment events from JSONL, JSON array, TSV, CSV, line-delimited text, or a directory of `*_comments.jsonl` files.
+    /// Loads comment events from `.json` scenario files, JSONL, TSV, CSV, or a directory.
     public static func loadList(fromFile path: String) -> [CommentEvent]? {
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
@@ -84,18 +277,33 @@ public struct CommentEvent: Codable, Sendable, Equatable {
             return []
         }
 
-        if trimmedAll.hasPrefix("[") {
+        if trimmedAll.hasPrefix("[") || trimmedAll.hasPrefix("{") {
             if let data = trimmedAll.data(using: .utf8),
-               let rawArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                var events: [CommentEvent] = []
-                var autoTime = 0.0
-                for dict in rawArray {
-                    if let ev = parseDictionary(dict, defaultTimestamp: autoTime) {
-                        autoTime = ev.timestamp + 0.5
-                        events.append(ev)
+               let root = try? JSONSerialization.jsonObject(with: data) {
+                if let rawArray = root as? [[String: Any]] {
+                    if let first = rawArray.first,
+                       (first["reaction_state"] != nil || first["reactionState"] != nil || first["data"] != nil) {
+                        let scenarios = rawArray.compactMap { parseScenarioDictionary($0) }
+                        return scenarios.flatMap(\.data)
+                    }
+                    var events: [CommentEvent] = []
+                    var autoTime = 0.0
+                    for dict in rawArray {
+                        if let ev = parseDictionary(dict, defaultTimestamp: autoTime) {
+                            autoTime = ev.timestamp + 0.5
+                            events.append(ev)
+                        }
+                    }
+                    return events
+                }
+                if let rawDict = root as? [String: Any] {
+                    if let nested = (rawDict["scenarios"] ?? rawDict["items"] ?? rawDict["episodes"]) as? [[String: Any]] {
+                        return nested.compactMap { parseScenarioDictionary($0) }.flatMap(\.data)
+                    }
+                    if let single = parseScenarioDictionary(rawDict) {
+                        return single.data
                     }
                 }
-                return events
             }
         }
 
@@ -157,7 +365,11 @@ public struct CommentEvent: Codable, Sendable, Equatable {
         return nil
     }
 
-    private static func parseDictionary(_ dict: [String: Any], defaultTimestamp: Double) -> CommentEvent? {
+    private static func parseDictionary(
+        _ dict: [String: Any],
+        defaultTimestamp: Double,
+        fallbackReactionIndex: Int? = nil
+    ) -> CommentEvent? {
         let ts: Double = if let v = (dict["timestamp"] ?? dict["time"] ?? dict["t"] ?? dict["offset"]) as? Double {
             v
         } else if let v = (dict["timestamp"] ?? dict["time"] ?? dict["t"] ?? dict["offset"]) as? Int {
@@ -181,7 +393,7 @@ public struct CommentEvent: Codable, Sendable, Equatable {
             0
         }
 
-        let reactionIdx = parseReactionTag(dict["reactionIndex"] ?? dict["reaction"] ?? dict["label"] ?? dict["emotion"] ?? dict["target"])
+        let reactionIdx = parseReactionTag(dict["reactionIndex"] ?? dict["reaction"] ?? dict["label"] ?? dict["emotion"] ?? dict["target"]) ?? fallbackReactionIndex
 
         return CommentEvent(timestamp: ts, user: user, text: text, superChatJPY: sc, reactionIndex: reactionIdx)
     }

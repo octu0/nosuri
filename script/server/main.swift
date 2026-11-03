@@ -322,8 +322,7 @@ private func handleWebSocketSession(fd: Int32) {
     }
 
     let initEvent = CommentEvent(timestamp: 0.0, text: "", superChatJPY: 0)
-    let initPred = engine.pushDetailed(initEvent)
-    engine.reset()
+    let initPred = engine.state(at: 0.0)
     if let data = try? encoder.encode(makeMessage(event: initEvent, isIdle: true, pred: initPred, elapsedMs: 0.1)),
        let str = String(data: data, encoding: .utf8) {
         _ = sendWebSocketText(fd, str)
@@ -379,8 +378,7 @@ private func handleWebSocketSession(fd: Int32) {
             engine.reset()
             streamTime = 0.0
             let resetEvent = CommentEvent(timestamp: 0.0, text: "", superChatJPY: 0)
-            let pred = engine.pushDetailed(resetEvent)
-            engine.reset()
+            let pred = engine.state(at: 0.0)
             if let data = try? encoder.encode(makeMessage(event: resetEvent, isIdle: true, pred: pred, elapsedMs: 0.1)),
                let str = String(data: data, encoding: .utf8) {
                 if sendWebSocketText(fd, str) != true { break }
@@ -388,22 +386,26 @@ private func handleWebSocketSession(fd: Int32) {
             continue
         }
 
-        let isIdle = (incoming.type == "idle_tick") || ((incoming.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (incoming.superChatJPY ?? 0) <= 0)
-        let dt = incoming.deltaSeconds ?? (isIdle ? 2.5 : 0.35)
+        let isStateQuery = (incoming.type == "state" || incoming.type == "idle_tick")
+            || ((incoming.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (incoming.superChatJPY ?? 0) <= 0)
+        let dt = incoming.deltaSeconds ?? (isStateQuery ? 3.0 : 0.35)
         streamTime += max(0.05, dt)
 
+        let t0 = Date().timeIntervalSinceReferenceDate
         let event = CommentEvent(
             timestamp: streamTime,
-            user: isIdle ? "" : (incoming.user ?? ""),
-            text: isIdle ? "" : (incoming.text ?? ""),
-            superChatJPY: max(0, incoming.superChatJPY ?? 0)
+            user: isStateQuery ? "" : (incoming.user ?? ""),
+            text: isStateQuery ? "" : (incoming.text ?? ""),
+            superChatJPY: isStateQuery ? 0 : max(0, incoming.superChatJPY ?? 0)
         )
-
-        let t0 = Date().timeIntervalSinceReferenceDate
-        let pred = engine.pushDetailed(event, topK: 5)
+        let pred: ReactionPrediction = if isStateQuery {
+            engine.state(at: streamTime, topK: 5)
+        } else {
+            engine.ingest(event, topK: 5)
+        }
         let elapsedMs = (Date().timeIntervalSinceReferenceDate - t0) * 1000.0
 
-        if let data = try? encoder.encode(makeMessage(event: event, isIdle: isIdle, pred: pred, elapsedMs: elapsedMs)),
+        if let data = try? encoder.encode(makeMessage(event: event, isIdle: isStateQuery, pred: pred, elapsedMs: elapsedMs)),
            let str = String(data: data, encoding: .utf8) {
             if sendWebSocketText(fd, str) != true { break }
         }

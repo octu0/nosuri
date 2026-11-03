@@ -100,4 +100,52 @@ final class ReactionCatalogTests: XCTestCase {
         let datasets = CommentEvent.loadDatasets(from: [tempDir.path])
         XCTAssertEqual(datasets.count, 2)
     }
+
+    func testScenarioJSONLoadingAndTimeBasedDecay() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("scenario_json_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let jsonPath = tempDir.appendingPathComponent("tease.json")
+        let jsonContent = """
+        [
+          {
+            "reaction_state": "#0->#5_2",
+            "note": "複数人がポンコツいじりコメントを投稿し、#0から#5_2に変化する",
+            "data": [
+              {"timestamp": 1.0, "user": "u1", "superchat": 0, "text": "またポンコツムーブしてるーw"},
+              {"timestamp": 1.4, "user": "u2", "superchat": 0, "text": "むすっとしてるぞw"},
+              {"timestamp": 1.8, "user": "u3", "superchat": 0, "text": "ほっぺ膨らませてぷく顔になってるぞ！"},
+              {"timestamp": 2.2, "user": "u4", "superchat": 0, "text": "完全に拗ねてるw"}
+            ]
+          },
+          {
+            "reaction_state": "#5_2->#5_3",
+            "note": "拗ね状態からさらにいじりとスパチャが重なり#5_3へ変化する",
+            "data": [
+              {"timestamp": 2.6, "user": "u5", "superchat": 1000, "text": "ガチおこぷんぷん丸で草💢"},
+              {"timestamp": 3.0, "user": "u6", "superchat": 0, "text": "いじりすぎてガチ拗ねモード突入w"}
+            ]
+          }
+        ]
+        """
+        try jsonContent.write(to: jsonPath, atomically: true, encoding: .utf8)
+
+        let scenarioDatasets = CommentEvent.loadScenarioDatasets(from: [tempDir.path])
+        XCTAssertEqual(scenarioDatasets.count, 1)
+        XCTAssertEqual(scenarioDatasets[0].scenarios.count, 2)
+        XCTAssertEqual(scenarioDatasets[0].scenarios[0].fromState, ReactionStateSpec(baseIndex: 0))
+        XCTAssertEqual(scenarioDatasets[0].scenarios[0].toState, ReactionStateSpec(baseIndex: 5, tier: 2))
+        XCTAssertEqual(scenarioDatasets[0].scenarios[1].fromState, ReactionStateSpec(baseIndex: 5, tier: 2))
+        XCTAssertEqual(scenarioDatasets[0].scenarios[1].toState, ReactionStateSpec(baseIndex: 5, tier: 3))
+
+        let filter = EmotionSlopeFilter(numClasses: 39)
+        let frontEnd = CommentStreamFrontEnd()
+        let episodes = filter.buildTrainingEpisodes(scenarios: scenarioDatasets[0].scenarios, frontEnd: frontEnd)
+        // 2 standalone episodes + 1 chained multi-stage episode (#0 -> #5_2 -> #5_3)
+        XCTAssertEqual(episodes.count, 3)
+        XCTAssertEqual(episodes[0].dominants.first, 0)
+        XCTAssertEqual(episodes[0].dominants.last, 5)
+        XCTAssertEqual(episodes[1].dominants.last, 5)
+    }
 }

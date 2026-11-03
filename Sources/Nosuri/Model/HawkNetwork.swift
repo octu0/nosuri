@@ -38,6 +38,19 @@ public final class HawkNetwork: @unchecked Sendable {
             attentionValues = [[Float]](repeating: [], count: weights.attention.count)
             attentionPosition = [Int](repeating: 0, count: weights.attention.count)
         }
+
+        /// Attenuates the recurrent memory and causal convolution buffer after an elapsed silence gap.
+        public func attenuate(by factor: Float) {
+            let clamped = max(0.0, min(1.0, factor))
+            for l in 0..<memory.count {
+                for i in 0..<memory[l].count {
+                    memory[l][i] *= clamped
+                }
+                for i in 0..<convBuffer[l].count {
+                    convBuffer[l][i] *= clamped
+                }
+            }
+        }
     }
 
     public init(weights: HawkWeights) {
